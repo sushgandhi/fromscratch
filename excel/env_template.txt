@@ -1,0 +1,17 @@
+# Excel Agent Environment Variables
+
+# Note: API now accepts Anthropic API key via Bearer token in Authorization header
+# This environment variable is only needed for direct Python usage, not for API calls
+
+# Anthropic Claude API Key (optional - only for direct Python usage)
+ANTHROPIC_API_KEY=your_anthropic_api_key_here
+
+# AWS Configuration (optional, for S3 support)
+AWS_ACCESS_KEY_ID=your_aws_access_key
+AWS_SECRET_ACCESS_KEY=your_aws_secret_key
+AWS_DEFAULT_REGION=us-east-1
+AWS_S3_BUCKET=your-excel-agent-bucket
+
+# API Configuration
+API_HOST=0.0.0.0
+API_PORT=8000 
