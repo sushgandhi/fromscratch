@@ -5,16 +5,29 @@ from typing import List, Dict, Any, Optional, Union
 from pydantic import BaseModel, Field
 import pandas as pd
 import numpy as np
+import json
+import logging
 from .base_tool import BaseTool, ToolInput, ToolOutput
 from src.utils.data_utils import get_workbook_sheets, read_excel_file, save_to_s3, convert_numpy_types
+from src.utils.claude_client import get_claude_client
 import plotly.express as px
 import plotly.graph_objects as go
 from jinja2 import Template
+from langchain.schema import HumanMessage
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Constants for LLM processing
+DEFAULT_SAMPLE_ROWS = 100
+MAX_TEXT_SAMPLE_SIZE = 50
 
 
 class ColumnSummaryInput(ToolInput):
     """Input model for column summary tool"""
     columns: Optional[List[str]] = Field(None, description="Specific columns to summarize")
+    use_llm_for_text: bool = Field(default=True, description="Use LLM to analyze text columns")
+    text_sample_size: int = Field(default=MAX_TEXT_SAMPLE_SIZE, description="Number of text samples to send to LLM")
 
 
 class ColumnSummaryTool(BaseTool):
@@ -40,7 +53,7 @@ class ColumnSummaryTool(BaseTool):
             else:
                 df_to_summarize = df
             
-            summary = self._generate_column_summary(df_to_summarize)
+            summary = self._generate_column_summary(df_to_summarize, input_data.use_llm_for_text, input_data.text_sample_size)
             
             if input_data.output_path:
                 save_to_s3(summary, input_data.output_path, format='json')
@@ -63,9 +76,10 @@ class ColumnSummaryTool(BaseTool):
                 error_message=f"Column summary failed: {str(e)}"
             )
     
-    def _generate_column_summary(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Generate detailed column summary"""
+    def _generate_column_summary(self, df: pd.DataFrame, use_llm_for_text: bool = True, text_sample_size: int = MAX_TEXT_SAMPLE_SIZE) -> Dict[str, Any]:
+        """Generate detailed column summary with LLM analysis for text columns"""
         summary = {}
+        text_columns_for_llm = []
         
         for column in df.columns:
             col_data = df[column]
@@ -89,6 +103,13 @@ class ColumnSummaryTool(BaseTool):
                     "q25": col_data.quantile(0.25),
                     "q75": col_data.quantile(0.75)
                 })
+                
+                # Add textual summary for numeric columns too
+                col_summary["textual_summary"] = (
+                    f"The column '{column}' has {len(col_data)} values with a mean of {col_data.mean():.2f} "
+                    f"and a standard deviation of {col_data.std():.2f}. Values range from {col_data.min():.2f} to {col_data.max():.2f}."
+                )
+                
             elif pd.api.types.is_string_dtype(col_data) or pd.api.types.is_object_dtype(col_data):
                 text_data = col_data.dropna().astype(str)
                 if len(text_data) > 0:
@@ -98,6 +119,18 @@ class ColumnSummaryTool(BaseTool):
                         "max_length": text_data.str.len().max(),
                         "most_common": text_data.value_counts().head(5).to_dict()
                     })
+                    
+                    # Prepare for LLM analysis if enabled
+                    if use_llm_for_text and len(text_data) > 0:
+                        sample_values = text_data.head(text_sample_size).tolist()
+                        text_columns_for_llm.append({
+                            "column_name": column,
+                            "sample_values": sample_values,
+                            "total_count": len(text_data),
+                            "unique_count": col_data.nunique(),
+                            "avg_length": text_data.str.len().mean()
+                        })
+                        
             elif pd.api.types.is_datetime64_any_dtype(col_data):
                 date_data = col_data.dropna()
                 if len(date_data) > 0:
@@ -109,12 +142,80 @@ class ColumnSummaryTool(BaseTool):
             
             summary[column] = convert_numpy_types(col_summary)
         
+        # Generate LLM summaries for text columns
+        if use_llm_for_text and text_columns_for_llm:
+            llm_summaries = self._generate_llm_column_summaries(text_columns_for_llm)
+            
+            # Merge LLM summaries back into main summary
+            for col_name, llm_summary in llm_summaries.items():
+                if col_name in summary:
+                    summary[col_name]["llm_summary"] = llm_summary
+        
         return summary
+    
+    def _generate_llm_column_summaries(self, text_columns: List[Dict[str, Any]]) -> Dict[str, str]:
+        """Generate LLM-based summaries for text columns"""
+        try:
+            # Get Claude client
+            llm = get_claude_client()
+            
+            # Prepare prompt for LLM
+            prompt = f"""Analyze the following text columns and provide concise summaries for each column based on the provided sample values. Each column summary should capture the key information, patterns, and purpose of that column.
+
+Return the summaries in the following JSON format:
+{{
+    "column_summaries": {{
+        "column_name_1": "Summary of column 1...",
+        "column_name_2": "Summary of column 2..."
+    }}
+}}
+
+Important guidelines:
+1. The JSON must be valid and properly formatted
+2. All keys and string values must use double quotes (")
+3. Any text containing special characters should be properly escaped
+4. Keep summaries concise but informative
+5. Focus on what the column represents and key patterns
+
+Columns to analyze:
+{json.dumps(text_columns, indent=2)}
+
+Provide only the JSON response, no other text."""
+
+            # Call LLM
+            messages = [HumanMessage(content=prompt)]
+            response = llm.invoke(messages)
+            content = response.content
+            
+            # Parse JSON response
+            try:
+                # Handle various response formats
+                if "```json" in content:
+                    json_content = content.split("```json")[1].split("```")[0].strip()
+                elif "```" in content:
+                    json_content = content.split("```")[1].split("```")[0].strip()
+                else:
+                    json_content = content.strip()
+                
+                llm_result = json.loads(json_content)
+                return llm_result.get("column_summaries", {})
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing LLM JSON response: {e}")
+                logger.error(f"Raw response: {content}")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"Error generating LLM summaries for columns: {e}")
+            return {}
 
 
 class RowSummaryInput(ToolInput):
     """Input model for row summary tool"""
     sample_size: int = Field(default=10, description="Number of sample rows to include")
+    create_summary_column: bool = Field(default=False, description="Create a new column with row-by-row LLM summaries")
+    summary_column_name: str = Field(default="row_summary", description="Name for the new summary column")
+    max_rows_for_llm: int = Field(default=50, description="Maximum number of rows to process with LLM")
 
 
 class RowSummaryTool(BaseTool):
@@ -125,27 +226,47 @@ class RowSummaryTool(BaseTool):
         self.description = "Generate row-level summaries and samples"
     
     def execute(self, input_data: RowSummaryInput) -> ToolOutput:
-        """Generate row summary"""
+        """Generate row summary and optionally create summary column"""
         try:
             df = self.load_data(input_data)
             
-            # Generate summary
+            # Generate basic row summary
             summary = self._generate_row_summary(df, input_data.sample_size)
+            
+            # Create summary column if requested
+            result_data = df.copy()
+            if input_data.create_summary_column:
+                summary_column = self._generate_row_summaries_column(
+                    df, 
+                    input_data.summary_column_name,
+                    input_data.max_rows_for_llm
+                )
+                result_data[input_data.summary_column_name] = summary_column
+                summary["summary_column_created"] = True
+                summary["summary_column_name"] = input_data.summary_column_name
             
             # Return results
             if input_data.output_path:
                 save_to_s3(summary, input_data.output_path, format='json')
                 return ToolOutput(
                     success=True,
-                    data=None,
+                    data=result_data.to_dict('records') if input_data.create_summary_column else None,
                     output_path=input_data.output_path,
-                    metadata={"total_rows": len(df)}
+                    metadata={
+                        "total_rows": len(df),
+                        "summary_column_created": input_data.create_summary_column,
+                        "summary_column_name": input_data.summary_column_name if input_data.create_summary_column else None
+                    }
                 )
             else:
                 return ToolOutput(
                     success=True,
-                    data=summary,
-                    metadata={"total_rows": len(df)}
+                    data=result_data.to_dict('records') if input_data.create_summary_column else summary,
+                    metadata={
+                        "total_rows": len(df),
+                        "summary_column_created": input_data.create_summary_column,
+                        "summary_column_name": input_data.summary_column_name if input_data.create_summary_column else None
+                    }
                 )
                 
         except Exception as e:
@@ -177,11 +298,121 @@ class RowSummaryTool(BaseTool):
                 })
         
         return summary
+    
+    def _generate_row_summaries_column(self, df: pd.DataFrame, column_name: str, max_rows: int) -> List[str]:
+        """Generate LLM-based summaries for each row and return as a list"""
+        try:
+            # Get Claude client
+            llm = get_claude_client()
+            
+            # Limit rows to prevent excessive API calls
+            rows_to_process = min(len(df), max_rows)
+            df_subset = df.head(rows_to_process)
+            
+            # Prepare column information for context
+            column_info = []
+            for col in df.columns:
+                col_info = {
+                    "name": col,
+                    "type": str(df[col].dtype),
+                    "description": f"Column '{col}' of type {df[col].dtype}"
+                }
+                column_info.append(col_info)
+            
+            # Process rows in batches to avoid token limits
+            batch_size = 10
+            summaries = []
+            
+            for batch_start in range(0, rows_to_process, batch_size):
+                batch_end = min(batch_start + batch_size, rows_to_process)
+                batch_rows = df_subset.iloc[batch_start:batch_end].to_dict('records')
+                
+                # Prepare batch prompt
+                prompt = f"""You are analyzing a dataset and need to create concise summaries for each row. 
+
+Dataset Context:
+- Total columns: {len(df.columns)}
+- Column information: {json.dumps(column_info, indent=2)}
+
+Please create a brief, informative summary for each row that captures the key information in that row. Each summary should be 1-2 sentences max.
+
+Return your response in the following JSON format:
+{{
+    "row_summaries": [
+        "Summary for row 1...",
+        "Summary for row 2...",
+        "Summary for row 3..."
+    ]
+}}
+
+Rows to summarize (batch {batch_start//batch_size + 1}):
+{json.dumps(batch_rows, indent=2, default=str)}
+
+Guidelines:
+1. Keep summaries concise but informative
+2. Focus on the most important/distinctive information in each row
+3. Use natural language that explains what the row represents
+4. Return exactly {len(batch_rows)} summaries in the JSON array
+5. Return only valid JSON
+
+Provide only the JSON response, no other text."""
+
+                # Call LLM for this batch
+                messages = [HumanMessage(content=prompt)]
+                response = llm.invoke(messages)
+                content = response.content
+                
+                # Parse batch response
+                try:
+                    # Handle various response formats
+                    if "```json" in content:
+                        json_content = content.split("```json")[1].split("```")[0].strip()
+                    elif "```" in content:
+                        json_content = content.split("```")[1].split("```")[0].strip()
+                    else:
+                        json_content = content.strip()
+                    
+                    batch_result = json.loads(json_content)
+                    batch_summaries = batch_result.get("row_summaries", [])
+                    
+                    # Ensure we have the right number of summaries
+                    if len(batch_summaries) != len(batch_rows):
+                        logger.warning(f"Expected {len(batch_rows)} summaries, got {len(batch_summaries)}")
+                        # Pad with generic summaries if needed
+                        while len(batch_summaries) < len(batch_rows):
+                            batch_summaries.append("Row data summary not available")
+                    
+                    summaries.extend(batch_summaries[:len(batch_rows)])
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error parsing batch LLM response: {e}")
+                    # Add generic summaries for failed batch
+                    for _ in range(len(batch_rows)):
+                        summaries.append("Summary generation failed")
+                
+                except Exception as e:
+                    logger.error(f"Error processing batch: {e}")
+                    # Add generic summaries for failed batch
+                    for _ in range(len(batch_rows)):
+                        summaries.append("Summary generation failed")
+            
+            # Pad with empty summaries for remaining rows if we processed fewer than total
+            while len(summaries) < len(df):
+                summaries.append("Row not processed (exceeds limit)")
+            
+            return summaries[:len(df)]  # Ensure exact length match
+            
+        except Exception as e:
+            logger.error(f"Error generating row summaries: {e}")
+            # Return generic summaries if LLM fails
+            return [f"Row {i+1} data" for i in range(len(df))]
 
 
 class SheetSummaryInput(ToolInput):
     """Input model for sheet summary tool"""
     include_visualizations: bool = Field(default=True, description="Whether to include basic visualizations")
+    use_llm_analysis: bool = Field(default=True, description="Use LLM for intelligent data analysis")
+    sample_rows: int = Field(default=DEFAULT_SAMPLE_ROWS, description="Number of sample rows for LLM analysis")
 
 
 class SheetSummaryTool(BaseTool):
@@ -197,7 +428,7 @@ class SheetSummaryTool(BaseTool):
             df = self.load_data(input_data)
             
             # Generate comprehensive summary
-            summary = self._generate_sheet_summary(df, input_data.include_visualizations)
+            summary = self._generate_sheet_summary(df, input_data.include_visualizations, input_data.use_llm_analysis, input_data.sample_rows)
             
             # Return results
             if input_data.output_path:
@@ -254,7 +485,7 @@ class SheetSummaryTool(BaseTool):
                 error_message=f"Sheet summary failed: {str(e)}"
             )
     
-    def _generate_sheet_summary(self, df: pd.DataFrame, include_viz: bool) -> Dict[str, Any]:
+    def _generate_sheet_summary(self, df: pd.DataFrame, include_viz: bool, use_llm_analysis: bool = True, sample_rows: int = DEFAULT_SAMPLE_ROWS) -> Dict[str, Any]:
         """Generate comprehensive sheet summary"""
         
         # Basic statistics
@@ -301,6 +532,10 @@ class SheetSummaryTool(BaseTool):
         if include_viz and len(df) > 0:
             summary["visualizations"] = self._generate_basic_visualizations(df)
         
+        # Generate LLM analysis if requested
+        if use_llm_analysis and len(df) > 0:
+            summary["llm_analysis"] = self._generate_llm_sheet_analysis(df, sample_rows)
+        
         return convert_numpy_types(summary)
     
     def _find_strong_correlations(self, corr_matrix: pd.DataFrame, threshold: float = 0.7) -> List[Dict]:
@@ -338,6 +573,82 @@ class SheetSummaryTool(BaseTool):
             visualizations["correlation_heatmap"] = fig.to_html(include_plotlyjs=True)
         
         return visualizations
+    
+    def _generate_llm_sheet_analysis(self, df: pd.DataFrame, sample_rows: int) -> Dict[str, str]:
+        """Generate LLM-based intelligent analysis of the entire sheet"""
+        try:
+            # Get Claude client
+            llm = get_claude_client()
+            
+            # Prepare sample data for LLM
+            sample_data = df.head(sample_rows).to_dict('records')
+            column_info = []
+            
+            for col in df.columns:
+                col_data = df[col]
+                col_info = {
+                    "name": col,
+                    "type": str(col_data.dtype),
+                    "sample_values": col_data.dropna().head(10).tolist()
+                }
+                column_info.append(col_info)
+            
+            # Prepare comprehensive analysis prompt
+            prompt = f"""Analyze this dataset and provide intelligent insights. You are looking at a dataset with {len(df)} rows and {len(df.columns)} columns.
+
+Column Information:
+{json.dumps(column_info, indent=2, default=str)}
+
+Sample Data (first {min(sample_rows, len(df))} rows):
+{json.dumps(sample_data, indent=2, default=str)}
+
+Please provide a comprehensive analysis in the following JSON format:
+{{
+    "data_insights": {{
+        "overall_purpose": "What this dataset appears to be about and its main purpose",
+        "key_patterns": "Main patterns or trends you notice in the data",
+        "data_quality_assessment": "Assessment of data quality, completeness, and potential issues",
+        "business_insights": "Business or domain-specific insights from the data",
+        "recommendations": "Recommendations for further analysis or data improvements"
+    }}
+}}
+
+Guidelines:
+1. Be specific and actionable in your insights
+2. Focus on business value and practical implications
+3. Identify potential data quality issues or anomalies
+4. Suggest meaningful analysis that could be performed
+5. Keep responses concise but informative
+6. Return only valid JSON
+
+Provide only the JSON response, no other text."""
+
+            # Call LLM
+            messages = [HumanMessage(content=prompt)]
+            response = llm.invoke(messages)
+            content = response.content
+            
+            # Parse JSON response
+            try:
+                # Handle various response formats
+                if "```json" in content:
+                    json_content = content.split("```json")[1].split("```")[0].strip()
+                elif "```" in content:
+                    json_content = content.split("```")[1].split("```")[0].strip()
+                else:
+                    json_content = content.strip()
+                
+                llm_result = json.loads(json_content)
+                return llm_result.get("data_insights", {})
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing LLM sheet analysis JSON: {e}")
+                logger.error(f"Raw response: {content}")
+                return {"error": "Failed to parse LLM analysis"}
+                
+        except Exception as e:
+            logger.error(f"Error generating LLM sheet analysis: {e}")
+            return {"error": f"LLM analysis failed: {str(e)}"}
     
     def _create_summary_html(self, summary: Dict[str, Any]) -> str:
         """Create HTML representation of summary"""
