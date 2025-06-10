@@ -28,6 +28,7 @@ class ColumnSummaryInput(ToolInput):
     columns: Optional[List[str]] = Field(None, description="Specific columns to summarize")
     use_llm_for_text: bool = Field(default=True, description="Use LLM to analyze text columns")
     text_sample_size: int = Field(default=MAX_TEXT_SAMPLE_SIZE, description="Number of text samples to send to LLM")
+    operation_id: Optional[str] = Field(None, description="Unique operation ID for file naming")
 
 
 class ColumnSummaryTool(BaseTool):
@@ -55,19 +56,35 @@ class ColumnSummaryTool(BaseTool):
             
             summary = self._generate_column_summary(df_to_summarize, input_data.use_llm_for_text, input_data.text_sample_size)
             
+            # Summary tools return analysis results, not tabular data
+            # Just return compact summary info to avoid context overflow
+            compact_summary = {
+                "summary_type": "column_analysis",
+                "columns_analyzed": list(df_to_summarize.columns),
+                "total_columns": len(df_to_summarize.columns),
+                "analysis_complete": True
+            }
+            
             if input_data.output_path:
                 save_to_s3(summary, input_data.output_path, format='json')
                 return ToolOutput(
                     success=True,
-                    data=None,
+                    data=compact_summary,  # Compact summary only
                     output_path=input_data.output_path,
-                    metadata={"columns_analyzed": len(df_to_summarize.columns)}
+                    metadata={
+                        "columns_analyzed": len(df_to_summarize.columns),
+                        "tool_type": "column_summary",
+                        "full_summary_path": input_data.output_path
+                    }
                 )
             else:
                 return ToolOutput(
                     success=True,
-                    data=summary,
-                    metadata={"columns_analyzed": len(df_to_summarize.columns)}
+                    data=compact_summary,  # Compact summary only
+                    metadata={
+                        "columns_analyzed": len(df_to_summarize.columns),
+                        "tool_type": "column_summary"
+                    }
                 )
                 
         except Exception as e:
@@ -216,6 +233,7 @@ class RowSummaryInput(ToolInput):
     create_summary_column: bool = Field(default=False, description="Create a new column with row-by-row LLM summaries")
     summary_column_name: str = Field(default="row_summary", description="Name for the new summary column")
     max_rows_for_llm: int = Field(default=50, description="Maximum number of rows to process with LLM")
+    operation_id: Optional[str] = Field(None, description="Unique operation ID for file naming")
 
 
 class RowSummaryTool(BaseTool):
@@ -245,29 +263,63 @@ class RowSummaryTool(BaseTool):
                 summary["summary_column_created"] = True
                 summary["summary_column_name"] = input_data.summary_column_name
             
-            # Return results
-            if input_data.output_path:
-                save_to_s3(summary, input_data.output_path, format='json')
-                return ToolOutput(
-                    success=True,
-                    data=result_data.to_dict('records') if input_data.create_summary_column else None,
-                    output_path=input_data.output_path,
-                    metadata={
+            # Handle results based on whether we created new data or just analysis
+            if input_data.create_summary_column:
+                # We created new columns - treat like data transformation tools
+                if input_data.operation_id:
+                    # Use new save_with_summary method for large datasets
+                    result = self.save_with_summary(result_data, input_data.operation_id)
+                    result.metadata.update({
                         "total_rows": len(df),
-                        "summary_column_created": input_data.create_summary_column,
-                        "summary_column_name": input_data.summary_column_name if input_data.create_summary_column else None
-                    }
-                )
+                        "summary_column_created": True,
+                        "summary_column_name": input_data.summary_column_name,
+                        "tool_type": "row_summary"
+                    })
+                    return result
+                else:
+                    # Fallback to old method
+                    return ToolOutput(
+                        success=True,
+                        data=result_data.to_dict('records'),
+                        output_path=None,
+                        metadata={
+                            "total_rows": len(df),
+                            "summary_column_created": True,
+                            "summary_column_name": input_data.summary_column_name,
+                            "tool_type": "row_summary"
+                        }
+                    )
             else:
-                return ToolOutput(
-                    success=True,
-                    data=result_data.to_dict('records') if input_data.create_summary_column else summary,
-                    metadata={
-                        "total_rows": len(df),
-                        "summary_column_created": input_data.create_summary_column,
-                        "summary_column_name": input_data.summary_column_name if input_data.create_summary_column else None
-                    }
-                )
+                # Just analysis - return compact summary
+                compact_summary = {
+                    "summary_type": "row_analysis",
+                    "total_rows": len(df),
+                    "analysis_complete": True
+                }
+                
+                if input_data.output_path:
+                    save_to_s3(summary, input_data.output_path, format='json')
+                    return ToolOutput(
+                        success=True,
+                        data=compact_summary,
+                        output_path=input_data.output_path,
+                        metadata={
+                            "total_rows": len(df),
+                            "summary_column_created": False,
+                            "tool_type": "row_summary",
+                            "full_summary_path": input_data.output_path
+                        }
+                    )
+                else:
+                    return ToolOutput(
+                        success=True,
+                        data=compact_summary,
+                        metadata={
+                            "total_rows": len(df),
+                            "summary_column_created": False,
+                            "tool_type": "row_summary"
+                        }
+                    )
                 
         except Exception as e:
             return ToolOutput(
@@ -413,6 +465,7 @@ class SheetSummaryInput(ToolInput):
     include_visualizations: bool = Field(default=True, description="Whether to include basic visualizations")
     use_llm_analysis: bool = Field(default=True, description="Use LLM for intelligent data analysis")
     sample_rows: int = Field(default=DEFAULT_SAMPLE_ROWS, description="Number of sample rows for LLM analysis")
+    operation_id: Optional[str] = Field(None, description="Unique operation ID for file naming")
 
 
 class SheetSummaryTool(BaseTool):
@@ -703,6 +756,7 @@ Provide only the JSON response, no other text."""
 class WorkbookSummaryInput(ToolInput):
     """Input model for workbook summary tool"""
     include_visualizations: bool = Field(default=True, description="Whether to include visualizations")
+    operation_id: Optional[str] = Field(None, description="Unique operation ID for file naming")
 
 
 class WorkbookSummaryTool(BaseTool):

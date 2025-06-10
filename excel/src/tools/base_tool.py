@@ -44,7 +44,8 @@ class BaseTool(ABC):
     
     def load_data(self, input_data: ToolInput) -> pd.DataFrame:
         """
-        Load data from either data_path or data field
+        Load data from either data_path or data field.
+        Handles both initial file loading and intermediate result loading.
         
         Args:
             input_data: Tool input containing data_path or data
@@ -55,13 +56,14 @@ class BaseTool(ABC):
         input_data.model_validate_input()
         
         if input_data.data_path:
-            # Load from file path
+            # Load from file path (could be initial file or intermediate result)
             if input_data.data_path.endswith('.csv'):
                 return read_csv_file(input_data.data_path)
             else:
                 return read_excel_file(input_data.data_path, input_data.sheet_name)
         else:
             # Convert from list of dicts to DataFrame
+            # Note: This should now only contain summary data, not full datasets
             return records_to_dataframe(input_data.data)
     
     def save_or_return_data(self, df: pd.DataFrame, output_path: Optional[str] = None) -> ToolOutput:
@@ -99,6 +101,66 @@ class BaseTool(ABC):
                 data=None,
                 output_path=None,
                 error_message=str(e)
+            )
+    
+    def save_with_summary(self, df: pd.DataFrame, operation_id: str, temp_dir: str = "temp_results") -> ToolOutput:
+        """
+        Save full dataset to file and return only summary for LLM context.
+        This prevents context overflow with large datasets.
+        
+        Args:
+            df: DataFrame with full results
+            operation_id: Unique operation ID for file naming
+            temp_dir: Directory to save temporary files
+            
+        Returns:
+            ToolOutput with summary data and file path to full data
+        """
+        import os
+        import uuid
+        
+        try:
+            # Create temp directory if it doesn't exist
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # Generate unique file path
+            file_path = os.path.join(temp_dir, f"{operation_id}_{uuid.uuid4().hex[:8]}.csv")
+            
+            # Save full dataset to CSV
+            df.to_csv(file_path, index=False)
+            
+            # Create summary data (first 5 rows + basic stats)
+            summary_data = []
+            
+            # Add first 5 rows
+            head_data = df.head(5).to_dict('records')
+            for i, row in enumerate(head_data):
+                row_summary = {f"row_{i+1}": str(row)[:200]}  # Truncate long values
+                summary_data.append(row_summary)
+            
+            # Add basic dataset info
+            summary_data.append({
+                "dataset_info": f"Total rows: {len(df)}, Columns: {list(df.columns)}"
+            })
+            
+            return ToolOutput(
+                success=True,
+                data=summary_data,  # Only summary goes to LLM context
+                output_path=file_path,  # Full data saved here for next tool
+                metadata={
+                    "rows": len(df), 
+                    "columns": len(df.columns),
+                    "summary_only": True,  # Flag to indicate this is summary
+                    "full_data_path": file_path
+                }
+            )
+            
+        except Exception as e:
+            return ToolOutput(
+                success=False,
+                data=None,
+                output_path=None,
+                error_message=f"Failed to save data with summary: {str(e)}"
             )
     
     def validate_and_correct_column(self, column_name: str, df: pd.DataFrame) -> tuple[str, Optional[str]]:

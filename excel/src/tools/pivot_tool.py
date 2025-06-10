@@ -15,6 +15,7 @@ class PivotInput(ToolInput):
     aggfunc: str = Field(default="sum", description="Aggregation function: sum, mean, count, min, max, std, var")
     fill_value: Optional[Union[int, float, str]] = Field(None, description="Value to fill missing entries")
     margins: bool = Field(default=False, description="Whether to add row/column totals")
+    operation_id: Optional[str] = Field(None, description="Unique operation ID for file naming")
 
 
 class PivotTool(BaseTool):
@@ -99,15 +100,23 @@ class PivotTool(BaseTool):
             # Reset index to make it a regular DataFrame
             pivot_df = pivot_df.reset_index()
             
-            # Return results
-            result = self.save_or_return_data(pivot_df, input_data.output_path)
+            # Save results with summary to prevent context overflow
+            if input_data.operation_id:
+                # Use new save_with_summary method for large datasets
+                result = self.save_with_summary(pivot_df, input_data.operation_id)
+            else:
+                # Fallback to old method for backward compatibility
+                result = self.save_or_return_data(pivot_df, input_data.output_path)
+            
+            # Add pivot-specific metadata
             result.metadata.update({
                 "pivot_index": input_data.index,
                 "pivot_columns": input_data.columns,
                 "pivot_values": input_data.values,
                 "aggregation_function": input_data.aggfunc,
                 "original_rows": len(df),
-                "pivot_rows": len(pivot_df)
+                "pivot_rows": len(pivot_df),
+                "tool_type": "pivot"
             })
             
             return result

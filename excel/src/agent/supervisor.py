@@ -68,7 +68,6 @@ class ExcelAgentSupervisor:
         workflow.add_node("sheet_analyzer", self._sheet_analyzer_node)
         workflow.add_node("planner", self._planner_node)
         workflow.add_node("executor", self._executor_node)
-        workflow.add_node("reviewer", self._reviewer_node)
         workflow.add_node("finalizer", self._finalizer_node)
         
         # Add edges
@@ -87,7 +86,6 @@ class ExcelAgentSupervisor:
             self._should_continue,
             {
                 "continue": "executor",
-                "review": "reviewer",
                 "finalize": "finalizer",
                 "end": END
             }
@@ -95,14 +93,6 @@ class ExcelAgentSupervisor:
         
         # Finalizer always goes to END
         workflow.add_edge("finalizer", END)
-        workflow.add_conditional_edges(
-            "reviewer",
-            self._review_decision,
-            {
-                "replan": "planner",
-                "end": END
-            }
-        )
         
         return workflow.compile()
     
@@ -477,14 +467,22 @@ Example response: "{clarification.get('example_response', 'Use sheet Sheet1')}"
         # Prepare input data
         input_params = operation.parameters.copy()
         
-        # If this operation depends on others, use the most recent result as input data
+        # If this operation depends on others, use the most recent result as input
         if operation.depends_on:
-            # Use the last dependency's data as the primary input
+            # Use the last dependency's output
             last_dep = operation.depends_on[-1]
             prev_result = file_state["operation_results"][last_dep]
-            if prev_result.get("data"):
+            
+            # Prefer output_path (full data file) over data (summary)
+            if prev_result.get("output_path"):
+                input_params["data_path"] = prev_result["output_path"]
+                input_params["data"] = None
+                print(f"📁 Loading data from previous result: {prev_result['output_path']}")
+            elif prev_result.get("data"):
+                # Fallback to summary data (for backward compatibility)
                 input_params["data"] = prev_result["data"]
                 input_params["data_path"] = None
+                print("⚠️ Warning: Using summary data - may be incomplete")
         else:
             # Use initial file data
             if file_state["current_data"]:
@@ -496,6 +494,9 @@ Example response: "{clarification.get('example_response', 'Use sheet Sheet1')}"
                 # Include sheet name if available
                 if file_state.get("sheet_name"):
                     input_params["sheet_name"] = file_state["sheet_name"]
+        
+        # Add operation_id to all tool inputs for file naming
+        input_params["operation_id"] = operation.operation_id
         
         # Create appropriate input object
         try:
@@ -563,53 +564,6 @@ Example response: "{clarification.get('example_response', 'Use sheet Sheet1')}"
                 "metadata": {},
                 "error_message": f"Failed to execute operation {operation.operation_id}: {str(e)}"
             }
-    
-    def _reviewer_node(self, state: AgentState) -> AgentState:
-        """Review the results and determine if goal is achieved"""
-        
-        reviewer_prompt = ChatPromptTemplate.from_template("""
-        Review the execution results and determine if the user's goal has been achieved.
-
-        Original Goal: {goal}
-        Completed Operations: {completed_operations}
-        Operation Results: {operation_results}
-        Error Message: {error_message}
-
-        Based on the results, determine if:
-        1. The goal has been fully achieved (respond: "achieved")
-        2. More operations are needed (respond: "replan")
-        3. There's an error that can't be recovered (respond: "error")
-
-        Only respond with one word: "achieved", "replan", or "error"
-        """)
-        
-        response = self.llm.invoke(
-            reviewer_prompt.format(
-                goal=state["goal"],
-                completed_operations=state["completed_operations"],
-                operation_results=state["operation_results"],
-                error_message=state["error_message"]
-            )
-        )
-        
-        decision = response.content.strip().lower()
-        
-        if decision == "achieved":
-            # Compile final result
-            state["final_result"] = {
-                "goal": state["goal"],
-                "completed_operations": state["completed_operations"],
-                "operation_results": state["operation_results"],
-                "success": True
-            }
-        elif decision == "error":
-            state["final_result"] = {
-                "goal": state["goal"],
-                "error": state["error_message"],
-                "success": False
-            }
-        
-        return state
     
     def _finalizer_node(self, state: AgentState) -> AgentState:
         """Create the final result with Excel workbook and S3 upload"""
@@ -741,7 +695,7 @@ Example response: "{clarification.get('example_response', 'Use sheet Sheet1')}"
         return state
     
     def _should_continue(self, state: AgentState) -> str:
-        """Determine if execution should continue (reviewer temporarily disabled)"""
+        """Determine if execution should continue or finalize"""
         if state["error_message"]:
             return "end"
         
@@ -755,13 +709,6 @@ Example response: "{clarification.get('example_response', 'Use sheet Sheet1')}"
             return "finalize"
         
         return "continue"
-    
-    def _review_decision(self, state: AgentState) -> str:
-        """Determine next step based on review"""
-        if state["final_result"]:
-            return "end"
-        
-        return "replan"
     
     def handle_sheet_clarifications(self, clarification_responses: Dict[str, str]) -> None:
         """

@@ -14,6 +14,7 @@ class FilterInput(ToolInput):
     value: Union[str, int, float, bool] = Field(description="Value to filter for")
     operator: str = Field(default="==", description="Filter operator: ==, !=, >, <, >=, <=, contains, startswith, endswith")
     case_sensitive: bool = Field(default=False, description="Whether string comparisons should be case sensitive")
+    operation_id: Optional[str] = Field(None, description="Unique operation ID for file naming")
 
 
 class FilterTool(BaseTool):
@@ -62,12 +63,20 @@ class FilterTool(BaseTool):
             # Apply filter
             filtered_df = self._apply_filter(df, input_data)
             
-            # Return results
-            result = self.save_or_return_data(filtered_df, input_data.output_path)
+            # Save results with summary to prevent context overflow
+            if input_data.operation_id:
+                # Use new save_with_summary method for large datasets
+                result = self.save_with_summary(filtered_df, input_data.operation_id)
+            else:
+                # Fallback to old method for backward compatibility
+                result = self.save_or_return_data(filtered_df, input_data.output_path)
+            
+            # Add filter-specific metadata
             result.metadata.update({
                 "filter_condition": f"{input_data.column} {input_data.operator} {input_data.value}",
                 "original_rows": len(df),
-                "filtered_rows": len(filtered_df)
+                "filtered_rows": len(filtered_df),
+                "tool_type": "filter"
             })
             
             return result

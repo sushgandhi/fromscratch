@@ -25,6 +25,7 @@ class VisualizationInput(ToolInput):
     width: int = Field(default=800, description="Chart width")
     height: int = Field(default=600, description="Chart height")
     in_memory_only: bool = Field(default=False, description="If True, don't save files, only return content in metadata")
+    operation_id: Optional[str] = Field(None, description="Unique operation ID for file naming")
 
 
 class VisualizationTool(BaseTool):

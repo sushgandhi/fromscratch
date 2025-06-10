@@ -15,6 +15,7 @@ class GroupByInput(ToolInput):
     )
     sort_by: Optional[str] = Field(None, description="Column to sort results by")
     sort_ascending: bool = Field(default=True, description="Sort order")
+    operation_id: Optional[str] = Field(None, description="Unique operation ID for file naming")
 
 
 class GroupByTool(BaseTool):
@@ -99,13 +100,21 @@ class GroupByTool(BaseTool):
             # Reset index to make it a regular DataFrame
             grouped_df = grouped_df.reset_index()
             
-            # Return results
-            result = self.save_or_return_data(grouped_df, input_data.output_path)
+            # Save results with summary to prevent context overflow
+            if input_data.operation_id:
+                # Use new save_with_summary method for large datasets
+                result = self.save_with_summary(grouped_df, input_data.operation_id)
+            else:
+                # Fallback to old method for backward compatibility
+                result = self.save_or_return_data(grouped_df, input_data.output_path)
+            
+            # Add groupby-specific metadata
             result.metadata.update({
                 "group_by_columns": input_data.group_by,
                 "aggregations": input_data.aggregations,
                 "original_rows": len(df),
-                "grouped_rows": len(grouped_df)
+                "grouped_rows": len(grouped_df),
+                "tool_type": "groupby"
             })
             
             return result
